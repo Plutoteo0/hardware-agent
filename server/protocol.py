@@ -51,6 +51,17 @@ class ProjectNew(BaseModel):
     name: str | None = None
 
 
+class ProjectDelete(BaseModel):
+    """Удалить проект (в корзину sandbox/projects/_trash). Ответ — Projects."""
+    type: Literal["project_delete"] = "project_delete"
+    name: str
+
+
+class HistoryList(BaseModel):
+    """Попросить последние вопросы-ответы текущего проекта. Ответ — History."""
+    type: Literal["history_list"] = "history_list"
+
+
 class AudioStart(BaseModel):
     """Начало голосовой задачи. Дальше идут двоичные кадры: PCM 16 бит, 16 кГц, моно."""
     type: Literal["audio_start"] = "audio_start"
@@ -112,6 +123,18 @@ class ProjectInfo(BaseModel):
     turns: int
 
 
+class HistoryItem(BaseModel):
+    q: str
+    a: str
+    error: bool = False
+
+
+class History(BaseModel):
+    """Новые сверху."""
+    type: Literal["history"] = "history"
+    items: list[HistoryItem]
+
+
 class SpeechStart(BaseModel):
     """Дальше идут двоичные кадры с озвучкой ответа: PCM 16 бит, моно, sample_rate Гц."""
     type: Literal["speech_start"] = "speech_start"
@@ -123,7 +146,8 @@ class SpeechEnd(BaseModel):
 
 
 ClientMessage = Annotated[
-    Union[Task, Decision, Cancel, Hello, AudioStart, AudioEnd, ProjectList, ProjectSwitch, ProjectNew],
+    Union[Task, Decision, Cancel, Hello, AudioStart, AudioEnd, ProjectList, ProjectSwitch, ProjectNew,
+          ProjectDelete, HistoryList],
     Field(discriminator="type"),
 ]
 client_adapter = TypeAdapter(ClientMessage)

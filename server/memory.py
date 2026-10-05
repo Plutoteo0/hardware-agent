@@ -26,6 +26,7 @@ OFFLOAD_PREVIEW = 1200      # сколько символов из него ос
 READ_OUTPUT_CHUNK = 3000
 
 OUTPUT_NAME = re.compile(r"^[\w\-]+\.txt$")
+AUTO_NAME = re.compile(r"^проект-\d{4}-\d{4}(-\d+)?$")  # имя по дате: модель потом придумает настоящее
 
 
 class MemoryError_(Exception):
@@ -99,6 +100,12 @@ class Project:
             if len(answer) > TURN_ANSWER_CHARS:
                 answer = answer[:TURN_ANSWER_CHARS] + "..."
             messages.append({"role": "user", "content": t["q"]})
+            # Вызовы тулов тоже показываем. Иначе модель видит «включи песню» -> «включаю песню»
+            # и учится отвечать текстом, ничего не делая. Сам результат тула не храним — только итог
+            for call in t.get("tools", []):
+                messages.append({"role": "assistant", "content": json.dumps(
+                    {"tool": call["tool"], "args": call.get("args", {})}, ensure_ascii=False)})
+                messages.append({"role": "tool", "content": "(выполнено)" if call.get("ok") else "(ошибка)"})
             # Прошлый ответ в том же формате, что требуем от модели: иначе она «забудет» JSON
             messages.append({"role": "assistant", "content": json.dumps({"final": answer}, ensure_ascii=False)})
         return messages
@@ -167,12 +174,42 @@ class ProjectStore:
         path = self.root / slugify(name)
         return Project(path) if path.is_dir() else None
 
-    def create(self, name: str | None = None) -> Project:
-        base = slugify(name or f"проект-{datetime.now():%m%d-%H%M}")
+    def _free_slug(self, name: str) -> str:
+        base = slugify(name)
         slug, n = base, 2
         while (self.root / slug).exists():   # имя занято — добавляем номер
             slug, n = f"{base}-{n}", n + 1
-        return Project(self.root / slug)
+        return slug
+
+    def create(self, name: str | None = None) -> Project:
+        return Project(self.root / self._free_slug(name or f"проект-{datetime.now():%m%d-%H%M}"))
+
+    def rename(self, project: Project, name: str) -> Project:
+        """Переименовать папку проекта. Если он был текущим — остаётся текущим."""
+        was_current = self.current().name == project.name
+        new_root = self.root / self._free_slug(name)
+        project.root.rename(new_root)
+        renamed = Project(new_root)
+        if was_current:
+            self.set_current(renamed)
+        return renamed
+
+    def delete(self, project: Project) -> None:
+        """Не стираем, а переносим в _trash: удалённое по ошибке можно вернуть руками.
+
+        Папки на «_» list() не показывает, поэтому из корзины проект в списке не виден.
+        """
+        if project.name == DEFAULT_PROJECT:
+            raise MemoryError_("default project cannot be deleted")
+        trash = self.root / "_trash"
+        trash.mkdir(exist_ok=True)
+        project.root.rename(trash / f"{project.name}-{datetime.now():%Y%m%d-%H%M%S}")
+        if self.current().name == project.name:
+            self.set_current(self.get(DEFAULT_PROJECT) or Project(self.root / DEFAULT_PROJECT))
+
+    @staticmethod
+    def is_auto_named(project: Project) -> bool:
+        return bool(AUTO_NAME.match(project.name))
 
     def current(self) -> Project:
         name = self._current_file.read_text(encoding="utf-8").strip() if self._current_file.is_file() else ""

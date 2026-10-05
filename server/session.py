@@ -4,6 +4,7 @@
 """
 import asyncio
 import json
+import re
 import uuid
 from contextlib import suppress
 from typing import Awaitable, Callable, Protocol
@@ -14,17 +15,42 @@ import time
 
 from memory import MemoryError_, Project, ProjectStore
 from models import Model
-from protocol import (ConfirmRequest, Error, ProjectInfo, ProjectItem, Projects, Result,
-                      SpeechEnd, SpeechStart, Status, Transcript)
+from quick import REPLIES, quick_command
+from protocol import (ConfirmRequest, Error, History, HistoryItem, ProjectInfo, ProjectItem, Projects,
+                      Result, SpeechEnd, SpeechStart, Status, Transcript)
 from stt import MAX_BYTES
 from tools import RISK, run_tool
 from tts import speech_text
 
 CONFIRM_TIMEOUT_S = 30
+
+# Модель говорит, что СДЕЛАЛА действие. Если при этом в ходе не было ни одного тула —
+# это выдумка: без тула она ничего не может сделать на ПК.
+# Только целые слова: «открытый язык», «включение питания» — это не утверждение о действии
+ACTION_CLAIM = re.compile(
+    r"\b(поставил[аи]?|включил[аи]?|включаю|открыл[аи]?|открываю|запустил[аи]?|запускаю|"
+    r"выключил[аи]?|переключил[аи]?|записал[аи]?|сохранил[аи]?|запомнил[аи]?|"
+    r"(поставлен|включен|открыт|запущен|установлен|увеличен|уменьшен|выключен|сохранен|сохранён)[аоы]?)\b",
+    re.IGNORECASE,
+)
+# Искал, но не открыл ни одной страницы: сниппеты — обрывки, по ним модель путает факты
+READ_PAGE_NUDGE = (
+    "Ты ответил по коротким сниппетам поиска, не открыв ни одной страницы. Открой самую подходящую ссылку "
+    'из результатов через fetch_url ({"tool": "fetch_url", "args": {"url": ...}}) и ответь по ней.'
+)
+
+# Не «ты ошибся» (тогда модель извиняется), а прямое указание, что делать дальше
+FAKE_ACTION_NUDGE = (
+    "Действие ещё не выполнено: тул не был вызван. Сейчас ответь JSON с вызовом нужного тула "
+    '({"tool": ..., "args": ...}). Если для просьбы тул не нужен — ответь {"final": ...} без слов о действиях.'
+)
 MAX_STEPS = 8  # предохранитель от зацикливания модели
 
 # Озвучка: шлём кусками по 0.2 с и не дальше чем на 2 с вперёд реального времени.
 # Иначе 20 секунд речи прилетят за долю секунды, и у платы переполнится буфер.
+HISTORY_ITEMS = 10          # сколько ходов отдаём плате в список истории
+HISTORY_ANSWER_CHARS = 2000 # длинный ответ в списке истории обрезаем
+
 SPEECH_CHUNK_S = 0.2
 SPEECH_AHEAD_S = 2.0
 
@@ -88,6 +114,48 @@ class Session:
         if not self.projects or self._busy():
             return
         self._use(self.projects.create(name))
+
+    def on_project_delete(self, name: str) -> None:
+        if not self.projects or self._busy():
+            return
+        project = self.projects.get(name)
+        if project is None:
+            asyncio.create_task(self.send(Error(text=f"no such project: {name}")))
+            return
+        try:
+            self.projects.delete(project)
+        except (MemoryError_, OSError) as e:
+            asyncio.create_task(self.send(Error(text=f"cannot delete: {e}")))
+            return
+        if self.project.name == project.name:   # удалили текущий — на «общее»
+            self._use(self.projects.current())
+        self.on_project_list()
+
+    def on_history_list(self) -> None:
+        if not self.project:
+            return
+        items = [HistoryItem(q=t["q"], a=t["a"][:HISTORY_ANSWER_CHARS], error=t.get("error", False))
+                 for t in reversed(self.project.turns()[-HISTORY_ITEMS:])]
+        asyncio.create_task(self.send(History(items=items)))
+
+    async def _auto_title(self, question: str) -> None:
+        """Проект с именем по дате после первого ответа получает настоящее имя."""
+        make_title = getattr(self.model, "make_title", None)
+        project = self.project
+        if not (make_title and self.projects and project and ProjectStore.is_auto_named(project)):
+            return
+        if len(project.turns()) != 1:
+            return
+        try:
+            title = await make_title(question)
+            if not title:
+                return
+            renamed = self.projects.rename(project, title)
+        except Exception:
+            return   # не придумалось или не переименовалось — останется имя по дате
+        if self.project is project:
+            self.project = renamed
+            await self.send(self._project_info())
 
     def _use(self, project: Project) -> None:
         self.project = project
@@ -198,16 +266,35 @@ class Session:
         context = self.project.context_messages() if self.project else []
         history = context + [{"role": "user", "content": text}]
         self._tools_log: list[dict] = []
+        nudged = False
+        nudged_read = False
         try:
+            # Короткие команды про музыку — без модели (см. quick.py)
+            quick = quick_command(text)
+            if quick:
+                output = await self._call_tool(quick["tool"], quick["args"])
+                ok = not output.startswith(("ERROR", "DENIED"))
+                await self._finish(text, REPLIES[quick["args"]["action"]] if ok else output, error=not ok)
+                return
+
             for _ in range(MAX_STEPS):
                 step = await self.model.next_step(history)
 
                 if "final" in step:
-                    self._record(text, step["final"])
-                    await self.send(Result(text=step["final"]))
-                    if self.speech:
-                        # Внутри той же задачи: cancel останавливает и озвучку
-                        await self._speak(step["final"])
+                    # Утверждает, что сделал, но тулов не было — один раз просим исправиться
+                    if not self._tools_log and not nudged and ACTION_CLAIM.search(step["final"]):
+                        nudged = True
+                        history.append({"role": "assistant", "content": json.dumps(step, ensure_ascii=False)})
+                        history.append({"role": "user", "content": FAKE_ACTION_NUDGE})
+                        continue
+                    # Был поиск, но ни одна страница не открыта — один раз просим прочитать источник
+                    used = {c["tool"] for c in self._tools_log}
+                    if "web_search" in used and "fetch_url" not in used and not nudged_read:
+                        nudged_read = True
+                        history.append({"role": "assistant", "content": json.dumps(step, ensure_ascii=False)})
+                        history.append({"role": "user", "content": READ_PAGE_NUDGE})
+                        continue
+                    await self._finish(text, step["final"])
                     return
 
                 name, args = step["tool"], step["args"]
@@ -227,6 +314,16 @@ class Session:
         except Exception as e:  # ошибка в задаче не должна ронять соединение
             self._record(text, f"{type(e).__name__}: {e}", error=True)
             await self.send(Error(text=f"{type(e).__name__}: {e}"))
+
+    async def _finish(self, question: str, answer: str, error: bool = False) -> None:
+        self._record(question, answer, error)
+        await self.send(Error(text=answer) if error else Result(text=answer))
+        if error:
+            return
+        await self._auto_title(question)
+        if self.speech:
+            # Внутри той же задачи: cancel останавливает и озвучку
+            await self._speak(answer)
 
     def _record(self, question: str, answer: str, error: bool = False) -> None:
         """Записать ход в историю проекта. Пишет сервер, не модель (см. memory.py)."""
@@ -260,7 +357,8 @@ class Session:
             "ok": ok,
         })
         # Большой результат — в файл проекта, модели — начало и как дочитать
-        if ok and self.project and name != "read_output":
+        # Поиск и погода и так короткие (5 результатов, 3 дня): их не обрезаем, иначе лишний шаг
+        if ok and self.project and name not in ("read_output", "web_search", "weather"):
             output = self.project.offload(name, output)
         return output
 

@@ -201,3 +201,121 @@ def test_projects_over_websocket(monkeypatch, isolated_projects):
         assert {i["name"] for i in listing["items"]} == {"общее", "погода"}
         ws.send_text('{"type": "project_switch", "name": "общее"}')
         assert json.loads(ws.receive_text())["name"] == "общее"
+
+
+# ---------- история для платы и автоназвание ----------
+
+class TitledModel(ScriptModel):
+    async def make_title(self, question):
+        return "Погода в Вроцлаве"
+
+
+def test_auto_title_after_first_answer(tmp_path):
+    store = ProjectStore(tmp_path)
+
+    async def go():
+        sent = []
+        s = make_session(store, TitledModel([{"final": "солнечно"}, {"final": "ок"}]), sent)
+        s.on_project_new(None)                 # имя по дате
+        await asyncio.sleep(0)
+        assert ProjectStore.is_auto_named(s.project)
+        s.start_task("какая погода во Вроцлаве?")
+        await s.task
+        s.start_task("а завтра?")              # второй ответ имя уже не трогает
+        await s.task
+        return s, sent
+
+    s, sent = run(go())
+    assert s.project.name == "погода-в-вроцлаве"
+    assert store.current().name == "погода-в-вроцлаве"
+    assert len(s.project.turns()) == 2          # история переехала вместе с папкой
+
+
+def test_named_project_is_not_renamed(tmp_path):
+    store = ProjectStore(tmp_path)
+
+    async def go():
+        s = make_session(store, TitledModel([{"final": "ок"}]), [])
+        s.start_task("привет")
+        await s.task
+        return s
+
+    assert run(go()).project.name == "общее"
+
+
+def test_history_list_newest_first(tmp_path):
+    store = ProjectStore(tmp_path)
+    p = store.current()
+    for i in range(12):
+        p.append_turn(f"q{i}", f"a{i}", [], error=(i == 11))
+
+    async def go():
+        sent = []
+        s = make_session(store, ScriptModel([]), sent)
+        s.on_history_list()
+        await asyncio.sleep(0)
+        return sent[0]
+
+    h = run(go())
+    assert [i.q for i in h.items][:3] == ["q11", "q10", "q9"]
+    assert len(h.items) == 10 and h.items[0].error
+
+
+# ---------- удаление ----------
+
+def test_delete_moves_to_trash_and_hides(tmp_path):
+    store = ProjectStore(tmp_path)
+    p = store.create("мусор")
+    p.append_turn("q", "a", [])
+    store.delete(p)
+    assert "мусор" not in [x.name for x in store.list()]
+    trashed = list((tmp_path / "_trash").iterdir())
+    assert len(trashed) == 1 and (trashed[0] / "history.jsonl").is_file()   # можно вернуть
+
+
+def test_default_project_cannot_be_deleted(tmp_path):
+    store = ProjectStore(tmp_path)
+    with pytest.raises(MemoryError_):
+        store.delete(store.current())
+
+
+def test_deleting_current_switches_to_default(tmp_path):
+    store = ProjectStore(tmp_path)
+
+    async def go():
+        sent = []
+        s = make_session(store, ScriptModel([]), sent)
+        s.on_project_new("временный")
+        await asyncio.sleep(0)
+        s.on_project_delete("временный")
+        await asyncio.sleep(0)
+        return s, sent
+
+    s, sent = run(go())
+    assert s.project.name == "общее" and store.current().name == "общее"
+    assert sent[-1].type == "projects" and "временный" not in [i.name for i in sent[-1].items]
+
+
+def test_delete_by_name_cannot_escape_store(tmp_path):
+    store = ProjectStore(tmp_path / "projects")
+    outside = tmp_path / "important"
+    outside.mkdir()
+
+    async def go():
+        sent = []
+        s = make_session(store, ScriptModel([]), sent)
+        s.on_project_delete("../important")
+        await asyncio.sleep(0)
+        return sent
+
+    run(go())
+    assert outside.is_dir()   # имя проходит через slugify: за папку проектов не выйти
+
+
+def test_context_shows_past_tool_calls(tmp_path):
+    p = Project(tmp_path / "p")
+    p.append_turn("включи песню", "Включаю.", [{"tool": "youtube", "args": {"query": "песня"}, "ok": True}])
+    msgs = p.context_messages()
+    # Модель должна видеть: вопрос -> вызов тула -> результат -> ответ, а не «вопрос -> ответ»
+    assert [m["role"] for m in msgs] == ["user", "assistant", "tool", "assistant"]
+    assert json.loads(msgs[1]["content"]) == {"tool": "youtube", "args": {"query": "песня"}}

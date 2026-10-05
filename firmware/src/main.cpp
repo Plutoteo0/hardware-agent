@@ -12,7 +12,10 @@
 //   карточка:  крутить — Да/Нет, клик — решение. Удержание игнорируется:
 //              голосом не подтверждаем (BRAINSTORM.md)
 //   ответ:     крутить — прокрутка, клик — замолчать и на главный
-//   история:   крутить — выбор, клик — открыть ответ (пункт «назад» — на главный)
+//   меню:      крутить с главного. «< назад», «Проект ▸», последние вопросы проекта
+//              (с сервера, переживают сон). Клик по вопросу — открыть ответ
+//   проекты:   «< назад», «+ новый проект», список. Клик — переключиться,
+//              удержание на проекте — «Удалить?» Да/Нет (в корзину, «общее» нельзя)
 //   боковая кнопка: уснуть сейчас
 //
 // Питание: без дела 30 с — экран тускнеет, 1 мин — гаснет (связь остаётся),
@@ -56,7 +59,7 @@ bool micOk = false, speakerOk = false, faceOk = false;
 
 // ---------- состояние ----------
 
-enum class Mode { Home, Listen, Think, Confirm, Answer, History };
+enum class Mode { Home, Listen, Think, Confirm, Answer, History, Projects, Delete };
 Mode mode = Mode::Home;
 
 bool wifiUp = false, wsUp = false;
@@ -71,10 +74,20 @@ String question;                 // что услышал сервер (transcri
 String thinking = "";            // что агент делает сейчас, по-русски
 bool answerIsError = false;
 
+// История и проекты хранит сервер (sandbox/projects), плата только показывает
 struct Entry { String q, a; bool err; };
-std::vector<Entry> history;      // новые сверху, не больше HISTORY_MAX
-const size_t HISTORY_MAX = 10;
-int historyIndex = 0;            // 0 — пункт «назад»
+std::vector<Entry> history;      // новые сверху
+bool historyLoaded = false;
+int historyIndex = 0;            // 0 — «назад», 1 — «Проект», дальше вопросы
+const int HISTORY_FIRST = 2;
+
+struct ProjectItem { String name; int turns; };
+std::vector<ProjectItem> projects;
+bool projectsLoaded = false;
+int projectIndex = 0;            // 0 — «назад», 1 — «+ новый», дальше проекты
+const int PROJECTS_FIRST = 2;
+String projectName;              // текущий проект, приходит в сообщении project
+String deleteName;               // какой проект спрашиваем удалить
 
 // Питание
 const uint32_t DIM_MS = 30 * 1000;
@@ -104,6 +117,13 @@ void text(int x, int y, const String& s, uint16_t color, const uint8_t* font = F
     u8f.setFontMode(1);
     u8f.setForegroundColor(color);
     u8f.drawUTF8(x, y, s.c_str());
+}
+
+// Текст, обрезанный по ширине. Шрифт выбираем ДО измерения: ширина зависит от шрифта,
+// а без выбранного шрифта библиотека обращается к пустому указателю и плата падает.
+void textFit(int x, int y, const String& s, int maxW, uint16_t color, const uint8_t* font = FONT) {
+    u8f.setFont(font);
+    text(x, y, fitUtf8(u8f, s, maxW), color, font);
 }
 
 // ---------- верхняя панель: Wi-Fi, сервер, батарея ----------
@@ -147,10 +167,10 @@ void drawBattery(int x, int y) {
 void drawTopBar() {
     tft.fillRect(0, 0, W, BAR_H, PANEL);
     tft.drawFastHLine(0, BAR_H, W, LINE);
-    tft.setTextColor(DIM, PANEL);
-    tft.drawString("AGENT", 8, 4, 2);
-    // Точка связи с сервером
-    tft.fillCircle(68, 11, 4, wsUp ? SPEAK : (wifiUp ? THINK : ERR));
+    // Точка связи с сервером и текущий проект
+    tft.fillCircle(10, 11, 4, wsUp ? SPEAK : (wifiUp ? THINK : ERR));
+    String title = projectName.length() ? projectName : String("агент");
+    textFit(20, 16, title, W - 140, DIM);
     drawWifi(W - 112, 4);
     drawBattery(W - 32, 3);
 }
@@ -163,6 +183,8 @@ String friendlyTool(const String& tool) {
     if (tool == "list_tree") return "Посмотреть файлы";
     if (tool == "web_search") return "Поиск в интернете";
     if (tool == "fetch_url") return "Открыть страницу";
+    if (tool == "open_url") return "Открыть ссылку на ПК";
+    if (tool == "open_app") return "Запустить программу";
     return tool;
 }
 
@@ -175,6 +197,14 @@ String friendlyStatus(const String& s) {
         if (tool == "write_file") return "записываю файл";
         if (tool == "web_search") return "ищу в интернете";
         if (tool == "fetch_url") return "открываю страницу";
+        if (tool == "remember") return "запоминаю";
+        if (tool == "read_output") return "дочитываю";
+        if (tool == "weather") return "смотрю погоду";
+        if (tool == "open_search") return "открываю поиск на ПК";
+        if (tool == "youtube") return "ищу на YouTube";
+        if (tool == "open_url") return "открываю ссылку";
+        if (tool == "open_app") return "запускаю программу";
+        if (tool == "media") return "управляю музыкой";
         return tool;
     }
     if (s == "recognizing speech") return "разбираю, что ты сказал";
@@ -203,7 +233,7 @@ void drawHome() {
     } else {
         face.setMood(Mood::Idle);
         String hint = "держи кнопку и говори";
-        if (!history.empty()) hint += "\n\nкрути: история";
+        hint += "\n\nкрути: история и проекты";
         drawSide("Готов", IDLE, hint);
     }
 }
@@ -284,31 +314,63 @@ void drawAnswer(const String& s) {
     body.draw();
 }
 
-void drawHistory() {
+// Общий список: заголовок и пункты. label(i, color, sel) отдаёт текст пункта i и может сменить цвет
+template <typename LabelFn>
+void drawList(const char* title, int count, int selected, LabelFn label) {
     clearBody();
-    text(8, BAR_H + 17, "История", IDLE, FONT_BIG);
+    text(8, BAR_H + 17, title, IDLE, FONT_BIG);
     const int itemH = 22, top = BAR_H + 26;
     const int visible = (H - top) / itemH;
     // Окно списка: выбранный пункт всегда виден
-    int first = max(0, historyIndex - visible + 1);
+    int first = max(0, selected - visible + 1);
     for (int row = 0; row < visible; row++) {
         int i = first + row;
-        if (i > (int)history.size()) break;
+        if (i >= count) break;
         int y = top + row * itemH;
-        bool sel = i == historyIndex;
+        bool sel = i == selected;
         if (sel) tft.fillRoundRect(4, y, W - 8, itemH - 2, 6, PANEL);
-        String label;
         uint16_t color = sel ? TEXT : DIM;
-        if (i == 0) {
-            label = "< назад";
-        } else {
-            const Entry& e = history[i - 1];
-            label = e.q.length() ? e.q : "(без вопроса)";
-            if (e.err) color = sel ? ERR : rgb(150, 70, 70);
-        }
-        text(14, y + 15, fitUtf8(u8f, label, W - 30), color);
+        String s = label(i, color, sel);
+        textFit(14, y + 15, s, W - 30, color);
     }
 }
+
+int historyCount() { return HISTORY_FIRST + (historyLoaded ? max(1, (int)history.size()) : 1); }
+
+void drawHistory() {
+    drawList("История", historyCount(), historyIndex, [](int i, uint16_t& color, bool sel) -> String {
+        if (i == 0) return "< назад";
+        if (i == 1) {
+            color = sel ? IDLE : rgb(40, 140, 150);
+            return "Проект: " + projectName + "  >";
+        }
+        if (!historyLoaded) return "загружаю...";
+        if (history.empty()) return "(пока пусто)";
+        const Entry& e = history[i - HISTORY_FIRST];
+        if (e.err) color = sel ? ERR : rgb(150, 70, 70);
+        return e.q.length() ? e.q : "(без вопроса)";
+    });
+}
+
+int projectCount() { return PROJECTS_FIRST + (projectsLoaded ? (int)projects.size() : 1); }
+
+void drawProjects() {
+    drawList("Проекты", projectCount(), projectIndex, [](int i, uint16_t& color, bool sel) -> String {
+        if (i == 0) return "< назад";
+        if (i == 1) {
+            color = sel ? SPEAK : rgb(50, 140, 80);
+            return "+ новый проект";
+        }
+        if (!projectsLoaded) return "загружаю...";
+        const ProjectItem& p = projects[i - PROJECTS_FIRST];
+        bool current = p.name == projectName;
+        if (current) color = sel ? IDLE : rgb(40, 140, 150);
+        return String(current ? "* " : "  ") + p.name + "  (" + String(p.turns) + ")";
+    });
+    text(W - 150, BAR_H + 16, "держи: удалить", DIM);
+}
+
+void drawDelete();   // ниже, рядом с отправкой на сервер
 
 void drawScreen() {
     switch (mode) {
@@ -318,11 +380,14 @@ void drawScreen() {
     case Mode::Confirm: drawConfirm(); break;
     case Mode::Answer: break;   // ответ рисуется вместе с текстом в drawAnswer
     case Mode::History: drawHistory(); break;
+    case Mode::Projects: drawProjects(); break;
+    case Mode::Delete: drawDelete(); break;
     }
 }
 
 bool faceVisible() {
-    return mode == Mode::Home || mode == Mode::Listen || mode == Mode::Think || mode == Mode::Confirm;
+    return mode == Mode::Home || mode == Mode::Listen || mode == Mode::Think || mode == Mode::Confirm ||
+           mode == Mode::Delete;
 }
 
 void go(Mode m) {
@@ -345,6 +410,31 @@ void sendType(const char* type) {
     JsonDocument doc;
     doc["type"] = type;
     sendJson(doc);
+}
+
+void drawDelete() {
+    clearBody();
+    face.setMood(Mood::Ask);
+    tft.fillRect(COL_X, BAR_H + 1, W - COL_X, H - BAR_H - 1, BG);
+    text(COL_X, 48, "Удалить?", ERR, FONT_BIG);
+    textFit(COL_X, 68, deleteName, COL_W, TEXT);
+    text(COL_X, 88, "файлы и историю", DIM);
+    text(COL_X, 104, "в корзину", DIM);
+    drawChoice();
+}
+
+void openHistory() {
+    historyLoaded = false;
+    history.clear();
+    historyIndex = HISTORY_FIRST;    // сразу на последний вопрос
+    sendType("history_list");
+}
+
+void openProjects() {
+    projectsLoaded = false;
+    projects.clear();
+    projectIndex = PROJECTS_FIRST;
+    sendType("project_list");
 }
 
 void sendDecision(bool approve) {
@@ -429,10 +519,6 @@ String argsToText(JsonObject args) {
     return s.length() ? s : "(без аргументов)";
 }
 
-void remember(const String& a, bool err) {
-    history.insert(history.begin(), Entry{question, a, err});
-    if (history.size() > HISTORY_MAX) history.pop_back();
-}
 
 void onServerMessage(const char* payload, size_t len) {
     touch();                         // новости от сервера — показать
@@ -460,6 +546,27 @@ void onServerMessage(const char* payload, size_t len) {
         confirmArgs = argsToText(doc["args"].as<JsonObject>());
         choiceYes = false;
         go(Mode::Confirm);
+    } else if (type == "project") {
+        projectName = doc["name"] | "";
+        drawTopBar();
+        // Переключились из списка проектов — на главный
+        if (mode == Mode::Projects || mode == Mode::Home) go(Mode::Home);
+    } else if (type == "projects") {
+        projects.clear();
+        for (JsonObject it : doc["items"].as<JsonArray>()) {
+            projects.push_back(ProjectItem{it["name"] | "", it["turns"] | 0});
+        }
+        projectsLoaded = true;
+        projectIndex = constrain(projectIndex, 0, projectCount() - 1);
+        if (mode == Mode::Projects) drawProjects();
+    } else if (type == "history") {
+        history.clear();
+        for (JsonObject it : doc["items"].as<JsonArray>()) {
+            history.push_back(Entry{it["q"] | "", it["a"] | "", it["error"] | false});
+        }
+        historyLoaded = true;
+        historyIndex = constrain(historyIndex, 0, historyCount() - 1);
+        if (mode == Mode::History) drawHistory();
     } else if (type == "speech_start") {
         speaker.start(doc["sample_rate"] | 22050);
         speechActive = true;
@@ -473,7 +580,6 @@ void onServerMessage(const char* payload, size_t len) {
             return;
         }
         answerIsError = isError;
-        remember(msg, isError);
         mode = Mode::Answer;
         drawAnswer(msg);
     }
@@ -574,16 +680,21 @@ void updatePower() {
 void onRotate(int dir) {
     switch (mode) {
     case Mode::Home:
-        if (!history.empty()) {
-            historyIndex = 1;        // сразу на последний вопрос
+        if (wsUp) {
+            openHistory();
             go(Mode::History);
         }
         break;
     case Mode::History:
-        historyIndex = constrain(historyIndex + dir, 0, (int)history.size());
+        historyIndex = constrain(historyIndex + dir, 0, historyCount() - 1);
         drawHistory();
         break;
+    case Mode::Projects:
+        projectIndex = constrain(projectIndex + dir, 0, projectCount() - 1);
+        drawProjects();
+        break;
     case Mode::Confirm:
+    case Mode::Delete:
         choiceYes = !choiceYes;      // два варианта: любой поворот переключает
         drawChoice();
         break;
@@ -596,8 +707,11 @@ void onRotate(int dir) {
 }
 
 void onButton(ButtonEvent ev) {
-    // Удержание везде, кроме карточки и записи, — начать говорить
-    if (ev == ButtonEvent::HoldStart && mode != Mode::Confirm && mode != Mode::Listen && mode != Mode::Think) {
+    // Удержание — начать говорить. Кроме карточек, записи, работы и списка проектов
+    // (там удержание = удалить проект)
+    bool holdIsVoice = mode != Mode::Confirm && mode != Mode::Listen && mode != Mode::Think &&
+                       mode != Mode::Projects && mode != Mode::Delete;
+    if (ev == ButtonEvent::HoldStart && holdIsVoice) {
         startListening();
         return;
     }
@@ -627,16 +741,58 @@ void onButton(ButtonEvent ev) {
         }
         break;
     case Mode::History:
-        if (ev == ButtonEvent::Click) {
-            if (historyIndex == 0) {
+        if (ev != ButtonEvent::Click) break;
+        if (historyIndex == 0) {
+            go(Mode::Home);
+        } else if (historyIndex == 1) {
+            openProjects();
+            go(Mode::Projects);
+        } else if (historyLoaded && !history.empty()) {
+            const Entry& e = history[historyIndex - HISTORY_FIRST];
+            answerIsError = e.err;
+            mode = Mode::Answer;
+            drawAnswer(e.a);
+        }
+        break;
+    case Mode::Projects:
+        if (ev == ButtonEvent::HoldStart) {
+            if (projectsLoaded && projectIndex >= PROJECTS_FIRST) {
+                deleteName = projects[projectIndex - PROJECTS_FIRST].name;
+                choiceYes = false;          // по умолчанию «Нет»
+                go(Mode::Delete);
+            }
+            break;
+        }
+        if (ev != ButtonEvent::Click) break;
+        if (projectIndex == 0) {
+            openHistory();
+            go(Mode::History);
+        } else if (projectIndex == 1) {
+            sendType("project_new");      // имя придумает модель после первого вопроса
+        } else if (projectsLoaded) {
+            const String& name = projects[projectIndex - PROJECTS_FIRST].name;
+            if (name == projectName) {
                 go(Mode::Home);
             } else {
-                const Entry& e = history[historyIndex - 1];
-                answerIsError = e.err;
-                mode = Mode::Answer;
-                drawAnswer(e.a);
+                JsonDocument doc;
+                doc["type"] = "project_switch";
+                doc["name"] = name;
+                sendJson(doc);                // ответ project переключит экран на главный
             }
         }
+        break;
+    case Mode::Delete:
+        if (ev != ButtonEvent::Click) break;
+        if (choiceYes) {
+            JsonDocument doc;
+            doc["type"] = "project_delete";
+            doc["name"] = deleteName;
+            sendJson(doc);                    // в ответ сервер пришлёт новый список проектов
+            projectsLoaded = false;
+            projects.clear();
+            projectIndex = PROJECTS_FIRST;
+        }
+        go(Mode::Projects);
         break;
     default:
         break;

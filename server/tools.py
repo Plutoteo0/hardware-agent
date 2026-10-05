@@ -6,6 +6,7 @@
 """
 from pathlib import Path
 
+from pc import media, open_app, open_search, open_url, weather, youtube
 from web import fetch_url, web_search
 
 SANDBOX = Path(__file__).resolve().parent.parent / "sandbox"
@@ -22,6 +23,13 @@ RISK = {
     "fetch_url": "auto",   # только чтение: скачивает страницу, внутренние адреса закрыты в web.py
     "remember": "auto",    # дописывает факт в notes.md проекта (см. memory.py)
     "read_output": "auto", # читает сохранённый большой результат тула
+    # ПК (см. pc.py): безвредное — сразу, открыть ссылку и запустить программу — с подтверждением
+    "open_search": "auto",
+    "youtube": "auto",
+    "media": "auto",
+    "weather": "auto",
+    "open_url": "ask",
+    "open_app": "ask",
     "rm": "forbidden",
 }
 
@@ -73,10 +81,16 @@ TOOLS = {
     "write_file": write_file,
     "web_search": web_search,
     "fetch_url": fetch_url,
+    "open_search": open_search,
+    "open_url": open_url,
+    "youtube": youtube,
+    "open_app": open_app,
+    "media": media,
+    "weather": weather,
 }
 
 
-FILE_TOOLS = {"list_tree", "read_file", "write_file"}  # им нужна папка проекта
+FILE_TOOLS = {"list_tree", "read_file", "write_file", "open_app"}  # им нужна папка проекта
 
 
 def run_tool(name: str, args: dict, root: Path | None = None) -> str:
