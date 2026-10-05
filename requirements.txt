@@ -3,3 +3,4 @@ uvicorn[standard]>=0.54
 websockets>=17
 pydantic>=2.13
 pytest>=9
+httpx>=0.28

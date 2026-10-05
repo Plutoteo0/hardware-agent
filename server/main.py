@@ -2,13 +2,24 @@
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel, ValidationError
 
-from models import MockModel
+import os
+
+from models import MockModel, Model, OllamaModel
 from protocol import Cancel, Decision, Error, Task, client_adapter
 from session import Session
 from tools import SANDBOX
 
 SANDBOX.mkdir(exist_ok=True)
 app = FastAPI()
+
+# AGENT_MODEL=ollama (по умолчанию) или mock — для отладки без Ollama.
+AGENT_MODEL = os.environ.get("AGENT_MODEL", "ollama")
+
+
+def make_model() -> Model:
+    if AGENT_MODEL == "mock":
+        return MockModel()
+    return OllamaModel()
 
 
 @app.get("/health")
@@ -23,7 +34,7 @@ async def ws_endpoint(ws: WebSocket):
     async def send(msg: BaseModel) -> None:
         await ws.send_text(msg.model_dump_json())
 
-    session = Session(MockModel(), send)
+    session = Session(make_model(), send)
     try:
         # Этот цикл обязан не блокироваться: пока агент ждёт подтверждения,
         # тут должно прийти Decision. Поэтому задача запускается через

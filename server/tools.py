@@ -49,13 +49,14 @@ def read_file(path: str) -> str:
     f = safe_path(path)
     if not f.is_file():
         raise ToolError(f"not a file: {path}")
-    return f.read_text(errors="replace")[:20000]  # обрезка, чтобы не забить контекст
+    # encoding явно: на Windows по умолчанию cp1251, и русский текст превращается в кашу
+    return f.read_text(encoding="utf-8", errors="replace")[:20000]  # обрезка, чтобы не забить контекст
 
 
 def write_file(path: str, content: str) -> str:
     f = safe_path(path)
     f.parent.mkdir(parents=True, exist_ok=True)
-    f.write_text(content)
+    f.write_text(content, encoding="utf-8")
     return f"wrote {len(content)} chars to {path}"
 
 

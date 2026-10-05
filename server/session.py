@@ -3,14 +3,16 @@
 Здесь агентный цикл и логика подтверждений.
 """
 import asyncio
+import json
 import uuid
+from contextlib import suppress
 from typing import Awaitable, Callable
 
 from pydantic import BaseModel
 
 from models import Model
 from protocol import ConfirmRequest, Error, Result, Status
-from tools import RISK, ToolError, run_tool
+from tools import RISK, run_tool
 
 CONFIRM_TIMEOUT_S = 30
 MAX_STEPS = 8  # предохранитель от зацикливания модели
@@ -63,12 +65,17 @@ class Session:
                     return
 
                 name, args = step["tool"], step["args"]
+                # Сохраняем и сам вызов, и результат: иначе модель не помнит,
+                # что уже делала, и начинает повторяться.
+                history.append({"role": "assistant", "content": json.dumps(step, ensure_ascii=False)})
                 output = await self._call_tool(name, args)
                 history.append({"role": "tool", "content": output})
 
             await self.send(Error(text="step limit reached"))
         except asyncio.CancelledError:
-            await self.send(Status(text="cancelled"))
+            # При отключении клиента сокет уже закрыт, и send может упасть.
+            with suppress(Exception):
+                await self.send(Status(text="cancelled"))
             raise
         except Exception as e:  # ошибка в задаче не должна ронять соединение
             await self.send(Error(text=f"{type(e).__name__}: {e}"))
@@ -85,9 +92,11 @@ class Session:
                 return "DENIED: user rejected the call"
 
         await self.send(Status(text=f"running {name}"))
+        # Любая ошибка тула (даже OSError при записи) уходит модели как текст,
+        # а не роняет всю задачу: модель может исправить аргументы и попробовать снова.
         try:
             return run_tool(name, args)
-        except ToolError as e:
+        except Exception as e:
             return f"ERROR: {e}"
 
     async def _confirm(self, name: str, args: dict) -> bool:

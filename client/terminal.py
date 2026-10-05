@@ -13,13 +13,16 @@ import websockets
 URL = os.environ.get("AGENT_URL", "ws://127.0.0.1:8000/ws")
 
 
-async def read_server(ws, confirm_q: asyncio.Queue):
+async def read_server(ws, state: dict):
     async for raw in ws:
         m = json.loads(raw)
         t = m["type"]
         if t == "confirm_request":
-            await confirm_q.put(m)  # отвечать будет другая корутина (stdin)
+            state["confirm"] = m
+            print(f"\n[CONFIRM {m['id']}] {m['tool']}({json.dumps(m['args'], ensure_ascii=False)})"
+                  f"  y/n? ({m['timeout_s']}s)")
         elif t == "status":
+            state["confirm"] = None
             print(f"  ... {m['text']}")
         elif t == "result":
             print(f"\n[RESULT] {m['text']}\n")
@@ -27,33 +30,35 @@ async def read_server(ws, confirm_q: asyncio.Queue):
             print(f"\n[ERROR] {m['text']}\n")
 
 
-async def ask_user(ws, confirm_q: asyncio.Queue):
-    loop = asyncio.get_running_loop()
-    while True:
-        m = await confirm_q.get()
-        print(f"\n[CONFIRM {m['id']}] {m['tool']}({json.dumps(m['args'], ensure_ascii=False)})"
-              f"  y/n? ({m['timeout_s']}s)")
-        # input() блокирующий, поэтому в executor, чтобы не стопорить сеть
-        answer = await loop.run_in_executor(None, sys.stdin.readline)
-        approve = answer.strip().lower() == "y"
-        await ws.send(json.dumps({"type": "decision", "id": m["id"], "approve": approve}))
+# async def ask_user(ws, confirm_q: asyncio.Queue):
+#     loop = asyncio.get_running_loop()
+#     while True:
+#         m = await confirm_q.get()
+#         print(f"\n[CONFIRM {m['id']}] {m['tool']}({json.dumps(m['args'], ensure_ascii=False)})"
+#               f"  y/n? ({m['timeout_s']}s)")
+#         # input() блокирующий, поэтому в executor, чтобы не стопорить сеть
+#         answer = await loop.run_in_executor(None, sys.stdin.readline)
+#         approve = answer.strip().lower() == "y"
+#         await ws.send(json.dumps({"type": "decision", "id": m["id"], "approve": approve}))
 
 
 async def main():
-    confirm_q: asyncio.Queue = asyncio.Queue()
+    state = {"confirm": None}
     async with websockets.connect(URL) as ws:
-        asyncio.create_task(read_server(ws, confirm_q))
-        asyncio.create_task(ask_user(ws, confirm_q))
+        asyncio.create_task(read_server(ws, state))
         print("Команды: ls | read <path> | write <path> <text> | /cancel")
         loop = asyncio.get_running_loop()
         while True:
             line = (await loop.run_in_executor(None, sys.stdin.readline)).strip()
             if not line:
                 continue
+            if state["confirm"] is not None:
+                approve = line.lower() == "y"
+                await ws.send(json.dumps({"type": "decision", "id": state["confirm"]["id"], "approve": approve}))
+                state["confirm"] = None
+                continue
             msg = {"type": "cancel"} if line == "/cancel" else {"type": "task", "text": line}
             await ws.send(json.dumps(msg))
-
-
 if __name__ == "__main__":
     try:
         asyncio.run(main())
