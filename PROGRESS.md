@@ -33,6 +33,17 @@
 - `Annotated[..., discriminator="type"]` только описывает схему, объект создаёт `validate_json`.
 - В цикле `main.py` задание запускается через `create_task`, иначе цикл завис бы и не принял `Decision`.
 
+## Репозиторий и переезд на ПК (2026-10-05)
+- Репо: https://github.com/Plutoteo0/hardware-agent (ветка `main`). Дальше работаем на ПК с RTX 4060 (8 ГБ VRAM).
+- Установка на ПК: `python -m venv .venv`, активировать, `pip install -r requirements.txt`.
+- Ollama ставится отдельно (ollama.com), модель для старта, например `qwen2.5-coder:7b`.
+- План на ПК:
+  1. Написать `OllamaModel` в `server/models.py` по интерфейсу `Model.next_step(history) -> {"tool", "args"} | {"final"}`.
+  2. Проверить, насколько стабильно модель вызывает `list_tree`, `read_file`, `write_file` (главный риск проекта). Если JSON тулов ломается, пробовать другую модель или упрощать описания тулов.
+  3. Подобрать рабочий `num_ctx` под 8 ГБ VRAM (от него зависит порог сводки около 70%).
+  4. Подключить `OllamaModel` вместо `MockModel` в `server/main.py`, оставить выбор через переменную окружения.
+- В новой сессии Claude Code сначала прочитать `PROGRESS.md` и `BRAINSTORM.md`.
+
 ## Следующие шаги
 1. Запустить сервер: из корня `.venv/bin/uvicorn main:app --app-dir server`, проверить `GET /health`.
 2. Запустить `client/terminal.py` и пройти сценарии: `ls`, `read`, `write` (с `y`, с `n`, с таймаутом).
