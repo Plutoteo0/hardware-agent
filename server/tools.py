@@ -5,6 +5,8 @@ safe_path — это главная защита от ../ и симлинков.
 """
 from pathlib import Path
 
+from web import fetch_url, web_search
+
 SANDBOX = Path(__file__).resolve().parent.parent / "sandbox"
 
 # Уровни риска — данные, не код: легко менять и показывать на экране.
@@ -15,6 +17,8 @@ RISK = {
     "list_tree": "auto",
     "read_file": "auto",
     "write_file": "ask",
+    "web_search": "auto",  # только чтение: отправляет запрос в поиск
+    "fetch_url": "auto",   # только чтение: скачивает страницу, внутренние адреса закрыты в web.py
     "rm": "forbidden",
 }
 
@@ -60,7 +64,13 @@ def write_file(path: str, content: str) -> str:
     return f"wrote {len(content)} chars to {path}"
 
 
-TOOLS = {"list_tree": list_tree, "read_file": read_file, "write_file": write_file}
+TOOLS = {
+    "list_tree": list_tree,
+    "read_file": read_file,
+    "write_file": write_file,
+    "web_search": web_search,
+    "fetch_url": fetch_url,
+}
 
 
 def run_tool(name: str, args: dict) -> str:

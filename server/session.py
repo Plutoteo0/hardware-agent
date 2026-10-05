@@ -95,7 +95,8 @@ class Session:
         # Любая ошибка тула (даже OSError при записи) уходит модели как текст,
         # а не роняет всю задачу: модель может исправить аргументы и попробовать снова.
         try:
-            return run_tool(name, args)
+            # В отдельном потоке: сетевые тулы могут ждать секунды, а цикл должен принимать Decision/Cancel
+            return await asyncio.to_thread(run_tool, name, args)
         except Exception as e:
             return f"ERROR: {e}"
 
