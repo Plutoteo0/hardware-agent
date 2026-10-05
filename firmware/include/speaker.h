@@ -79,13 +79,24 @@ public:
 
     bool playing() const { return head_.load() != tail_.load(); }
 
-    void setVolume(float v) { volume_ = constrain(v, 0.0f, 1.0f); }
+    // 1.0 — как прислал сервер. Больше 1 — усиление с мягким ограничителем (см. softClip)
+    void setVolume(float v) { volume_ = constrain(v, 0.0f, 2.0f); }
 
 private:
     uint8_t* buf_ = nullptr;
     std::atomic<size_t> head_{0}, tail_{0};   // head пишет loop, tail — задача динамика
     std::atomic<bool> clearRequested_{false};
-    float volume_ = 0.6f;
+    float volume_ = 1.4f;
+
+    // Piper уже выдаёт речь на полную громкость (пик 1.0). Простое умножение на 1.4
+    // обрезало бы пики — это слышно как треск. Поэтому тихие звуки усиливаем как есть,
+    // а всё громче 0.7 плавно сжимаем к 1.0 через tanh: громче на слух, без треска.
+    static int16_t softClip(float x) {
+        const float knee = 0.7f;
+        float a = fabsf(x);
+        if (a > knee) a = knee + (1.0f - knee) * tanhf((a - knee) / (1.0f - knee));
+        return (int16_t)(copysignf(a, x) * 32767.0f);
+    }
 
     static void taskEntry(void* self) { ((Speaker*)self)->run(); }
 
@@ -108,7 +119,7 @@ private:
             tail_.store((tail + n) % BUF_SIZE);
 
             // Громкость программно: умножаем каждый сэмпл
-            for (size_t i = 0; i < n / 2; i++) chunk[i] = (int16_t)(chunk[i] * volume_);
+            for (size_t i = 0; i < n / 2; i++) chunk[i] = softClip(chunk[i] / 32768.0f * volume_);
 
             size_t written = 0;
             i2s_write(PORT, chunk, n, &written, portMAX_DELAY);

@@ -12,8 +12,10 @@ from pydantic import BaseModel
 
 import time
 
+from memory import MemoryError_, Project, ProjectStore
 from models import Model
-from protocol import ConfirmRequest, Error, Result, SpeechEnd, SpeechStart, Status, Transcript
+from protocol import (ConfirmRequest, Error, ProjectInfo, ProjectItem, Projects, Result,
+                      SpeechEnd, SpeechStart, Status, Transcript)
 from stt import MAX_BYTES
 from tools import RISK, run_tool
 from tts import speech_text
@@ -41,7 +43,7 @@ class Speaker(Protocol):
 class Session:
     def __init__(self, model: Model, send: Send, confirm_timeout: float = CONFIRM_TIMEOUT_S,
                  stt: Transcriber | None = None, tts: Speaker | None = None,
-                 send_bytes: SendBytes | None = None):
+                 send_bytes: SendBytes | None = None, projects: ProjectStore | None = None):
         self.model = model
         self.send = send
         self.confirm_timeout = confirm_timeout
@@ -52,9 +54,45 @@ class Session:
         self.pending: dict[str, asyncio.Future] = {}  # id подтверждения -> ожидание ответа
         self.task: asyncio.Task | None = None
         self.audio: bytearray | None = None  # не None = идёт запись голоса
+        # Без projects (старые тесты) — без памяти, тулы видят всю SANDBOX
+        self.projects = projects
+        self.project: Project | None = projects.current() if projects else None
+        self._tools_log: list[dict] = []   # какие тулы вызвала текущая задача (для истории)
 
     def on_hello(self, speech: bool) -> None:
         self.speech = speech and self.tts is not None and self.send_bytes is not None
+        if self.project:
+            asyncio.create_task(self.send(self._project_info()))
+
+    # ---- проекты ----
+
+    def _project_info(self) -> ProjectInfo:
+        return ProjectInfo(name=self.project.name, turns=len(self.project.turns()))
+
+    def on_project_list(self) -> None:
+        if not self.projects:
+            return
+        items = [ProjectItem(name=p.name, turns=len(p.turns())) for p in self.projects.list()]
+        asyncio.create_task(self.send(Projects(current=self.project.name, items=items)))
+
+    def on_project_switch(self, name: str) -> None:
+        if not self.projects or self._busy():   # посреди задачи проект не меняем
+            return
+        project = self.projects.get(name)
+        if project is None:
+            asyncio.create_task(self.send(Error(text=f"no such project: {name}")))
+            return
+        self._use(project)
+
+    def on_project_new(self, name: str | None) -> None:
+        if not self.projects or self._busy():
+            return
+        self._use(self.projects.create(name))
+
+    def _use(self, project: Project) -> None:
+        self.project = project
+        self.projects.set_current(project)
+        asyncio.create_task(self.send(self._project_info()))
 
     # ---- входящие сообщения от клиента ----
 
@@ -156,12 +194,16 @@ class Session:
     # ---- агентный цикл ----
 
     async def _run(self, text: str) -> None:
-        history = [{"role": "user", "content": text}]
+        # Память проекта (заметки, сводка, последние ходы) идёт перед новым вопросом
+        context = self.project.context_messages() if self.project else []
+        history = context + [{"role": "user", "content": text}]
+        self._tools_log: list[dict] = []
         try:
             for _ in range(MAX_STEPS):
                 step = await self.model.next_step(history)
 
                 if "final" in step:
+                    self._record(text, step["final"])
                     await self.send(Result(text=step["final"]))
                     if self.speech:
                         # Внутри той же задачи: cancel останавливает и озвучку
@@ -175,6 +217,7 @@ class Session:
                 output = await self._call_tool(name, args)
                 history.append({"role": "tool", "content": output})
 
+            self._record(text, "step limit reached", error=True)
             await self.send(Error(text="step limit reached"))
         except asyncio.CancelledError:
             # При отключении клиента сокет уже закрыт, и send может упасть.
@@ -182,7 +225,14 @@ class Session:
                 await self.send(Status(text="cancelled"))
             raise
         except Exception as e:  # ошибка в задаче не должна ронять соединение
+            self._record(text, f"{type(e).__name__}: {e}", error=True)
             await self.send(Error(text=f"{type(e).__name__}: {e}"))
+
+    def _record(self, question: str, answer: str, error: bool = False) -> None:
+        """Записать ход в историю проекта. Пишет сервер, не модель (см. memory.py)."""
+        if self.project:
+            with suppress(OSError):   # не смогли записать историю — ответ всё равно отдаём
+                self.project.append_turn(question, answer, self._tools_log, error)
 
     async def _call_tool(self, name: str, args: dict) -> str:
         # Неизвестный тул считаем запрещённым: безопасное значение по умолчанию.
@@ -199,10 +249,36 @@ class Session:
         # Любая ошибка тула (даже OSError при записи) уходит модели как текст,
         # а не роняет всю задачу: модель может исправить аргументы и попробовать снова.
         try:
-            # В отдельном потоке: сетевые тулы могут ждать секунды, а цикл должен принимать Decision/Cancel
-            return await asyncio.to_thread(run_tool, name, args)
+            output = await self._exec_tool(name, args)
+            ok = True
         except Exception as e:
-            return f"ERROR: {e}"
+            output, ok = f"ERROR: {e}", False
+        # В историю — что вызывали, без огромных значений (content файла, текст страницы)
+        self._tools_log.append({
+            "tool": name,
+            "args": {k: (v[:200] if isinstance(v, str) else v) for k, v in args.items()},
+            "ok": ok,
+        })
+        # Большой результат — в файл проекта, модели — начало и как дочитать
+        if ok and self.project and name != "read_output":
+            output = self.project.offload(name, output)
+        return output
+
+    async def _exec_tool(self, name: str, args: dict) -> str:
+        # Тулы памяти работают с проектом, а не с файлами песочницы
+        if name in ("remember", "read_output"):
+            if not self.project:
+                raise MemoryError_("memory is not available")
+            if name == "remember":
+                if set(args) != {"fact"}:
+                    raise MemoryError_("remember needs exactly one argument: fact")
+                return self.project.remember(args["fact"])
+            if not set(args) <= {"name", "offset"} or "name" not in args:
+                raise MemoryError_("read_output needs: name, optional offset")
+            return self.project.read_output(args["name"], args.get("offset", 0))
+        root = self.project.files if self.project else None
+        # В отдельном потоке: сетевые тулы могут ждать секунды, а цикл должен принимать Decision/Cancel
+        return await asyncio.to_thread(run_tool, name, args, root)
 
     async def _confirm(self, name: str, args: dict) -> bool:
         id = uuid.uuid4().hex[:8]

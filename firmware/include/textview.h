@@ -31,6 +31,7 @@ public:
 
     // Область экрана, где живёт текст
     void setArea(int x, int y, int w, int h) { x_ = x; y_ = y; w_ = w; h_ = h; }
+    void setColors(uint16_t fg, uint16_t bg) { fg_ = fg; bg_ = bg; }
 
     void setText(const String& text) {
         lines_.clear();
@@ -56,10 +57,10 @@ public:
     }
 
     void draw() {
-        tft_.fillRect(x_, y_, w_, h_, TFT_BLACK);
+        tft_.fillRect(x_, y_, w_, h_, bg_);
         u8f_.setFont(FONT);
         u8f_.setFontMode(1);
-        u8f_.setForegroundColor(TFT_WHITE);
+        u8f_.setForegroundColor(fg_);
         int n = visibleLines();
         for (int i = 0; i < n && top_ + i < (int)lines_.size(); i++) {
             // drawUTF8 рисует от базовой линии, поэтому + ascent
@@ -78,6 +79,7 @@ private:
     std::vector<String> lines_;
     int top_ = 0;
     int x_ = 0, y_ = 0, w_ = 0, h_ = 0;
+    uint16_t fg_ = TFT_WHITE, bg_ = TFT_BLACK;
 
     int textWidth() const { return w_ - SCROLLBAR_W - 4; }
     int visibleLines() const { return max(1, h_ / LINE_H); }
@@ -127,7 +129,7 @@ private:
         int bx = x_ + w_ - SCROLLBAR_W;
         int barH = max(10, h_ * n / total);
         int barY = y_ + (h_ - barH) * top_ / (total - n);
-        tft_.fillRect(bx, y_, SCROLLBAR_W, h_, TFT_DARKGREY);
+        tft_.fillRect(bx, y_, SCROLLBAR_W, h_, bg_ == TFT_BLACK ? TFT_DARKGREY : (uint16_t)(bg_ + 0x2104));
         tft_.fillRect(bx, barY, SCROLLBAR_W, barH, TFT_LIGHTGREY);
     }
 };

@@ -13,7 +13,9 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel, ValidationError
 
 from models import MockModel, Model, OllamaModel
-from protocol import AudioEnd, AudioStart, Cancel, Decision, Error, Hello, Task, client_adapter
+from memory import ProjectStore
+from protocol import (AudioEnd, AudioStart, Cancel, Decision, Error, Hello, ProjectList, ProjectNew,
+                      ProjectSwitch, Task, client_adapter)
 from session import Session
 from stt import WhisperTranscriber
 from tools import SANDBOX
@@ -39,6 +41,9 @@ SANDBOX.mkdir(exist_ok=True)
 # грузить их на каждого клиента незачем
 TRANSCRIBER = WhisperTranscriber()
 SPEAKER = PiperSpeaker()
+
+# Проекты: sandbox/projects/<имя>/ (см. memory.py)
+PROJECTS = ProjectStore(SANDBOX / "projects")
 
 
 @asynccontextmanager
@@ -99,7 +104,8 @@ async def ws_endpoint(ws: WebSocket):
         await ws.send_bytes(data)
 
     session = Session(make_model(), send, stt=TRANSCRIBER,
-                      tts=SPEAKER if SPEAKER.available() else None, send_bytes=send_bytes)
+                      tts=SPEAKER if SPEAKER.available() else None, send_bytes=send_bytes,
+                      projects=PROJECTS)
     try:
         # Этот цикл обязан не блокироваться: пока агент ждёт подтверждения,
         # тут должно прийти Decision. Поэтому задача запускается через
@@ -127,6 +133,12 @@ async def ws_endpoint(ws: WebSocket):
                 session.cancel()
             elif isinstance(msg, Hello):
                 session.on_hello(msg.speech)
+            elif isinstance(msg, ProjectList):
+                session.on_project_list()
+            elif isinstance(msg, ProjectSwitch):
+                session.on_project_switch(msg.name)
+            elif isinstance(msg, ProjectNew):
+                session.on_project_new(msg.name)
             elif isinstance(msg, AudioStart):
                 session.on_audio_start()
             elif isinstance(msg, AudioEnd):

@@ -1,7 +1,8 @@
 """Тулы агента, уровни риска и проверка путей.
 
-Агент видит только папку SANDBOX. Любой путь от модели проходит через
-safe_path — это главная защита от ../ и симлинков.
+Агент видит только одну папку: папку файлов текущего проекта (root).
+Любой путь от модели проходит через safe_path — это главная защита от ../ и симлинков.
+Без root работает вся SANDBOX (так было до проектов, так работают старые тесты).
 """
 from pathlib import Path
 
@@ -19,6 +20,8 @@ RISK = {
     "write_file": "ask",
     "web_search": "auto",  # только чтение: отправляет запрос в поиск
     "fetch_url": "auto",   # только чтение: скачивает страницу, внутренние адреса закрыты в web.py
+    "remember": "auto",    # дописывает факт в notes.md проекта (см. memory.py)
+    "read_output": "auto", # читает сохранённый большой результат тула
     "rm": "forbidden",
 }
 
@@ -27,38 +30,38 @@ class ToolError(Exception):
     pass
 
 
-def safe_path(rel: str) -> Path:
-    """Превращает путь от модели в абсолютный и проверяет, что он внутри SANDBOX.
+def safe_path(rel: str, root: Path | None = None) -> Path:
+    """Превращает путь от модели в абсолютный и проверяет, что он внутри root.
 
     resolve() раскрывает и '..', и симлинки, поэтому сравниваем уже
     настоящий путь. Проверка по строке ('..' in rel) была бы обходимой.
     """
-    root = SANDBOX.resolve()
+    root = (root or SANDBOX).resolve()
     full = (root / rel).resolve()
     if full != root and root not in full.parents:
         raise ToolError(f"path outside sandbox: {rel}")
     return full
 
 
-def list_tree(path: str = ".") -> str:
-    base = safe_path(path)
+def list_tree(path: str = ".", *, root: Path | None = None) -> str:
+    base = safe_path(path, root)
     if not base.is_dir():
         raise ToolError(f"not a directory: {path}")
-    root = SANDBOX.resolve()
+    root = (root or SANDBOX).resolve()
     lines = sorted(str(p.relative_to(root)) for p in base.rglob("*"))
     return "\n".join(lines) or "(empty)"
 
 
-def read_file(path: str) -> str:
-    f = safe_path(path)
+def read_file(path: str, *, root: Path | None = None) -> str:
+    f = safe_path(path, root)
     if not f.is_file():
         raise ToolError(f"not a file: {path}")
     # encoding явно: на Windows по умолчанию cp1251, и русский текст превращается в кашу
     return f.read_text(encoding="utf-8", errors="replace")[:20000]  # обрезка, чтобы не забить контекст
 
 
-def write_file(path: str, content: str) -> str:
-    f = safe_path(path)
+def write_file(path: str, content: str, *, root: Path | None = None) -> str:
+    f = safe_path(path, root)
     f.parent.mkdir(parents=True, exist_ok=True)
     f.write_text(content, encoding="utf-8")
     return f"wrote {len(content)} chars to {path}"
@@ -73,11 +76,19 @@ TOOLS = {
 }
 
 
-def run_tool(name: str, args: dict) -> str:
+FILE_TOOLS = {"list_tree", "read_file", "write_file"}  # им нужна папка проекта
+
+
+def run_tool(name: str, args: dict, root: Path | None = None) -> str:
     fn = TOOLS.get(name)
     if fn is None:
         raise ToolError(f"unknown tool: {name}")
+    # root задаёт сервер, а не модель: иначе модель могла бы выбрать себе другую папку
+    if "root" in args:
+        raise ToolError("argument 'root' is not allowed")
     try:
+        if name in FILE_TOOLS:
+            return fn(**args, root=root)
         return fn(**args)
     except TypeError as e:  # неверные аргументы от модели
         raise ToolError(f"bad args for {name}: {e}")

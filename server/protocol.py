@@ -35,6 +35,22 @@ class Hello(BaseModel):
     speech: bool = False
 
 
+class ProjectList(BaseModel):
+    """Попросить список проектов. Ответ — Projects."""
+    type: Literal["project_list"] = "project_list"
+
+
+class ProjectSwitch(BaseModel):
+    type: Literal["project_switch"] = "project_switch"
+    name: str
+
+
+class ProjectNew(BaseModel):
+    """Новый проект и сразу переключиться на него. Без имени — имя по дате."""
+    type: Literal["project_new"] = "project_new"
+    name: str | None = None
+
+
 class AudioStart(BaseModel):
     """Начало голосовой задачи. Дальше идут двоичные кадры: PCM 16 бит, 16 кГц, моно."""
     type: Literal["audio_start"] = "audio_start"
@@ -78,6 +94,24 @@ class Transcript(BaseModel):
     text: str
 
 
+class ProjectItem(BaseModel):
+    name: str
+    turns: int
+
+
+class Projects(BaseModel):
+    type: Literal["projects"] = "projects"
+    current: str
+    items: list[ProjectItem]
+
+
+class ProjectInfo(BaseModel):
+    """Текущий проект. Приходит после hello и после переключения."""
+    type: Literal["project"] = "project"
+    name: str
+    turns: int
+
+
 class SpeechStart(BaseModel):
     """Дальше идут двоичные кадры с озвучкой ответа: PCM 16 бит, моно, sample_rate Гц."""
     type: Literal["speech_start"] = "speech_start"
@@ -89,6 +123,7 @@ class SpeechEnd(BaseModel):
 
 
 ClientMessage = Annotated[
-    Union[Task, Decision, Cancel, Hello, AudioStart, AudioEnd], Field(discriminator="type")
+    Union[Task, Decision, Cancel, Hello, AudioStart, AudioEnd, ProjectList, ProjectSwitch, ProjectNew],
+    Field(discriminator="type"),
 ]
 client_adapter = TypeAdapter(ClientMessage)

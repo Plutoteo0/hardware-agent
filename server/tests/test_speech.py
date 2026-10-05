@@ -86,6 +86,7 @@ def test_hello_over_websocket(monkeypatch):
     client = TestClient(main.app)
     with client.websocket_connect("/ws", headers={"Authorization": "Bearer t"}) as ws:
         ws.send_text('{"type": "hello", "speech": true}')
+        assert json.loads(ws.receive_text())["type"] == "project"   # после hello — текущий проект
         ws.send_text('{"type": "task", "text": "hello"}')
         assert json.loads(ws.receive_text())["type"] == "result"
         assert json.loads(ws.receive_text())["type"] == "speech_start"
