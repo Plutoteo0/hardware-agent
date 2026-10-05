@@ -5,15 +5,19 @@
 """
 import os
 import secrets
+import threading
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel, ValidationError
 
 from models import MockModel, Model, OllamaModel
-from protocol import Cancel, Decision, Error, Task, client_adapter
+from protocol import AudioEnd, AudioStart, Cancel, Decision, Error, Hello, Task, client_adapter
 from session import Session
+from stt import WhisperTranscriber
 from tools import SANDBOX
+from tts import PiperSpeaker
 
 
 def load_dotenv(path: Path) -> None:
@@ -30,7 +34,24 @@ def load_dotenv(path: Path) -> None:
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 SANDBOX.mkdir(exist_ok=True)
-app = FastAPI()
+
+# Одна модель Whisper и один голос Piper на все подключения: они большие,
+# грузить их на каждого клиента незачем
+TRANSCRIBER = WhisperTranscriber()
+SPEAKER = PiperSpeaker()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Грузим модели в фоне при старте: сервер сразу принимает подключения,
+    # а первая голосовая задача не ждёт загрузку
+    if os.environ.get("STT_PRELOAD", "1") == "1":
+        threading.Thread(target=TRANSCRIBER.preload, daemon=True).start()
+        threading.Thread(target=SPEAKER.preload, daemon=True).start()
+    yield
+
+
+app = FastAPI(lifespan=lifespan)
 
 # AGENT_MODEL=ollama (по умолчанию) или mock — для отладки без Ollama.
 AGENT_MODEL = os.environ.get("AGENT_MODEL", "ollama")
@@ -74,15 +95,26 @@ async def ws_endpoint(ws: WebSocket):
     async def send(msg: BaseModel) -> None:
         await ws.send_text(msg.model_dump_json())
 
-    session = Session(make_model(), send)
+    async def send_bytes(data: bytes) -> None:
+        await ws.send_bytes(data)
+
+    session = Session(make_model(), send, stt=TRANSCRIBER,
+                      tts=SPEAKER if SPEAKER.available() else None, send_bytes=send_bytes)
     try:
         # Этот цикл обязан не блокироваться: пока агент ждёт подтверждения,
         # тут должно прийти Decision. Поэтому задача запускается через
         # create_task (в session.start_task), а не через await.
         while True:
-            raw = await ws.receive_text()
+            # receive() вместо receive_text(): кадр бывает и текстом (JSON), и байтами (звук)
+            frame = await ws.receive()
+            if frame["type"] == "websocket.disconnect":
+                break
+            if frame.get("bytes") is not None:
+                session.on_audio_chunk(frame["bytes"])
+                continue
+
             try:
-                msg = client_adapter.validate_json(raw)
+                msg = client_adapter.validate_json(frame.get("text") or "")
             except ValidationError:
                 await send(Error(text="invalid message"))
                 continue
@@ -93,6 +125,12 @@ async def ws_endpoint(ws: WebSocket):
                 session.on_decision(msg.id, msg.approve)
             elif isinstance(msg, Cancel):
                 session.cancel()
+            elif isinstance(msg, Hello):
+                session.on_hello(msg.speech)
+            elif isinstance(msg, AudioStart):
+                session.on_audio_start()
+            elif isinstance(msg, AudioEnd):
+                session.on_audio_end()
     except WebSocketDisconnect:
         pass
     finally:

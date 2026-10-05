@@ -1,16 +1,17 @@
-// Шаг 2 прошивки: Wi-Fi + WebSocket к серверу агента.
+// Прошивка T-Embed: Wi-Fi + WebSocket к серверу агента + голосовой ввод.
 //
 // Плата — второй клиент рядом с client/terminal.py, протокол тот же:
-//   плата -> сервер:  task, decision, cancel
-//   сервер -> плата:  status, confirm_request, result, error
+//   плата -> сервер:  hello, task, decision, cancel, audio_start, <байты звука>, audio_end
+//   сервер -> плата:  status, confirm_request, result, error, transcript,
+//                     speech_start, <байты озвучки>, speech_end
 //
 // Управление:
 //   меню:      крутить — выбор задачи, клик — отправить
 //   работа:    клик — отменить задачу (cancel)
 //   карточка:  крутить — YES/NO, клик — решение (decision)
-//   ответ:     крутить — прокрутка, клик — назад в меню
-//   удержание: запись голоса (пока демо, шаг 3). В карточке игнорируется:
-//              голосом не подтверждаем (решение из BRAINSTORM.md).
+//   ответ:     крутить — прокрутка, клик — замолчать и назад в меню
+//   удержание: запись голоса, звук идёт на сервер потоком, пока держишь.
+//              В карточке игнорируется: голосом не подтверждаем (BRAINSTORM.md).
 #include <Arduino.h>
 #include <ArduinoJson.h>
 #include <RotaryEncoder.h>
@@ -20,9 +21,18 @@
 #include <WiFi.h>
 
 #include "button.h"
+#include "mic.h"
 #include "pins.h"
 #include "secrets.h"
+#include "speaker.h"
 #include "textview.h"
+
+Mic mic;
+bool micOk = false;
+Speaker speaker;
+bool speakerOk = false;
+bool speechActive = false;   // между speech_start и speech_end: сервер ещё присылает озвучку
+const uint32_t MAX_RECORD_MS = 30000;   // как MAX_SECONDS на сервере
 
 TFT_eSPI tft;
 U8g2_for_TFT_eSPI u8f;
@@ -128,15 +138,28 @@ void drawConfirm(const String& tool, const String& argsText, int timeoutS) {
 
 void drawRecording() {
     tft.fillScreen(TFT_BLACK);
-    drawHeader("RECORDING", TFT_RED);
-    tft.fillCircle(W / 2, 85, 26, TFT_RED);
+    drawHeader("RECORDING   release: send", TFT_RED);
+    tft.fillCircle(30, 70, 12, TFT_RED);
+    useText(TFT_WHITE);
+    u8f.drawUTF8(52, 76, "говори...");
+}
+
+// Индикатор громкости и таймер. peak — самый громкий сэмпл за последний кусок (0..32767)
+void drawLevel(int peak, uint32_t ms) {
+    const int x = 20, y = 100, w = W - 40, h = 16;
+    int filled = min(w, (int)((long)w * peak / 12000));   // 12000 — уже громкая речь вблизи
+    uint16_t color = peak > 30000 ? TFT_RED : peak > 1500 ? TFT_GREEN : TFT_DARKGREEN;
+    tft.fillRect(x, y, filled, h, color);
+    tft.fillRect(x + filled, y, w - filled, h, TFT_DARKGREY);
     tft.setTextColor(TFT_WHITE, TFT_BLACK);
-    tft.drawCentreString("release to send", W / 2, 125, 2);
+    char t[16];
+    snprintf(t, sizeof(t), "%2lu / %lu s  ", ms / 1000, MAX_RECORD_MS / 1000);
+    tft.drawString(t, x, y + 26, 2);
 }
 
 void drawAnswer(const String& text, bool isError) {
     tft.fillScreen(TFT_BLACK);
-    drawHeader(isError ? "ERROR   click: back" : "ANSWER   rotate: scroll  click: back",
+    drawHeader(isError ? "ERROR   click: back" : "ANSWER  rotate: scroll  click: stop/back",
                isError ? TFT_RED : TFT_GREEN);
     body.setText(text);
     body.draw();
@@ -178,11 +201,13 @@ void sendDecision(bool approve) {
     sendJson(doc);
 }
 
-void sendCancel() {
+void sendType(const char* type) {
     JsonDocument doc;
-    doc["type"] = "cancel";
+    doc["type"] = type;
     sendJson(doc);
 }
+
+void sendCancel() { sendType("cancel"); }
 
 // ---------- сообщения от сервера ----------
 
@@ -220,11 +245,20 @@ void onServerMessage(const char* payload, size_t len) {
         }
         setStatus(text);
         if (mode == Mode::Working) drawWorking(text);
+    } else if (type == "transcript") {
+        // Показываем, что сервер услышал: если распознал криво, сразу видно
+        setStatus("услышал");
+        drawWorking("Ты: " + text + "\n\nдумаю...");
     } else if (type == "confirm_request") {
         confirmId = doc["id"] | "";
         choiceYes = false;
         mode = Mode::Confirm;
         drawConfirm(doc["tool"] | "?", argsToText(doc["args"].as<JsonObject>()), doc["timeout_s"] | 0);
+    } else if (type == "speech_start") {
+        speaker.start(doc["sample_rate"] | 22050);
+        speechActive = true;
+    } else if (type == "speech_end") {
+        speechActive = false;      // буфер доиграет сам
     } else if (type == "result" || type == "error") {
         bool isError = type == "error";
         // error без активной задачи (например, "task already running") показываем в статусе
@@ -240,17 +274,25 @@ void onServerMessage(const char* payload, size_t len) {
 
 void onWsEvent(WStype_t type, uint8_t* payload, size_t length) {
     switch (type) {
-    case WStype_CONNECTED:
+    case WStype_CONNECTED: {
         wsUp = true;
+        // Сообщаем серверу, что умеем играть звук: без hello озвучку не пришлют
+        JsonDocument hello;
+        hello["type"] = "hello";
+        hello["speech"] = speakerOk;
+        sendJson(hello);
         setStatus("сервер подключён");
         redrawHeader();
         break;
+    }
     case WStype_DISCONNECTED:
         if (wsUp) {
             // Сервер при обрыве отменяет задачу, поэтому и мы возвращаемся в меню.
             // Висящее подтверждение не "досылаем": после переподключения оно недействительно.
             wsUp = false;
             confirmId = "";
+            speechActive = false;
+            speaker.stop();
             mode = Mode::Menu;
             setStatus("связь с сервером потеряна");
             drawMenu();
@@ -258,6 +300,9 @@ void onWsEvent(WStype_t type, uint8_t* payload, size_t length) {
         break;
     case WStype_TEXT:
         onServerMessage((const char*)payload, length);
+        break;
+    case WStype_BIN:
+        if (speechActive) speaker.push(payload, length);
         break;
     default:
         break;
@@ -284,10 +329,61 @@ void onRotate(int dir) {
     }
 }
 
+// Замолчать. Если сервер ещё присылает озвучку, его задача не закончена:
+// отменяем её, иначе следующая задача получит "task already running".
+void stopSpeech() {
+    if (speechActive) {
+        sendCancel();
+        speechActive = false;
+    }
+    speaker.stop();
+}
+
 void startRecording() {
+    if (!micOk) {
+        setStatus("микрофон не запустился");
+        return;
+    }
+    if (!wsUp) {
+        setStatus("нет связи с сервером");
+        return;
+    }
+    stopSpeech();                // не записывать собственный голос агента
+    mic.flush();                 // старый звук из буферов не нужен
+    sendType("audio_start");
     mode = Mode::Recording;
     recordStartedAt = millis();
     drawRecording();
+    drawLevel(0, 0);
+}
+
+void finishRecording() {
+    sendType("audio_end");
+    float sec = (millis() - recordStartedAt) / 1000.0f;
+    mode = Mode::Working;
+    setStatus("записано " + String(sec, 1) + " с");
+    drawWorking("распознаю речь...");
+}
+
+// Вызывается из loop, пока идёт запись: забрать звук и сразу отправить
+void pumpAudio() {
+    static int16_t buf[1024];             // 1024 сэмпла = 64 мс звука, 2 КБ на кадр
+    static uint32_t lastDraw = 0;
+    static int peak = 0;
+
+    size_t n = mic.read(buf, 1024);
+    if (n) {
+        ws.sendBIN((uint8_t*)buf, n * sizeof(int16_t));
+        for (size_t i = 0; i < n; i++) peak = max(peak, abs((int)buf[i]));
+    }
+
+    uint32_t ms = millis() - recordStartedAt;
+    if (millis() - lastDraw > 100) {      // экран 10 раз в секунду хватает
+        drawLevel(peak, ms);
+        lastDraw = millis();
+        peak = 0;
+    }
+    if (ms >= MAX_RECORD_MS) finishRecording();   // кнопку держат слишком долго
 }
 
 void onButton(ButtonEvent ev) {
@@ -325,16 +421,12 @@ void onButton(ButtonEvent ev) {
         break;
 
     case Mode::Recording:
-        if (ev == ButtonEvent::HoldEnd) {
-            float sec = (millis() - recordStartedAt) / 1000.0f;
-            mode = Mode::Menu;
-            setStatus("голос " + String(sec, 1) + " с: будет в шаге 3");
-            drawMenu();
-        }
+        if (ev == ButtonEvent::HoldEnd) finishRecording();
         break;
 
     case Mode::Answer:
         if (ev == ButtonEvent::Click) {
+            stopSpeech();
             mode = Mode::Menu;
             drawMenu();
         } else if (ev == ButtonEvent::HoldStart) {
@@ -365,6 +457,10 @@ void setup() {
     body.setArea(8, BODY_Y, W - 12, H - BODY_Y - STATUS_H - 4);
     argsView.setArea(8, BODY_Y, W - 12, 60);   // над кнопками YES/NO
     button.begin();
+    micOk = mic.begin();
+    Serial.println(micOk ? "mic: ok" : "mic: FAILED");
+    speakerOk = speaker.begin();
+    Serial.printf("speaker: %s (psram %u KB free)\n", speakerOk ? "ok" : "FAILED", ESP.getFreePsram() / 1024);
 
     WiFi.mode(WIFI_STA);
     WiFi.setAutoReconnect(true);
@@ -380,11 +476,12 @@ void setup() {
     ws.setReconnectInterval(3000);
     ws.enableHeartbeat(15000, 3000, 2);   // заметить обрыв, даже если сервер молчит
 
-    Serial.println("hardware-agent firmware: step 2 (wifi + websocket)");
+    Serial.println("hardware-agent firmware: step 4 (voice in + speech out)");
 }
 
 void loop() {
     ws.loop();
+    if (mode == Mode::Recording) pumpAudio();
 
     bool up = WiFi.status() == WL_CONNECTED;
     if (up != wifiUp) {

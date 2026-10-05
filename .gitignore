@@ -5,3 +5,4 @@ __pycache__/
 sandbox/
 .DS_Store
 .env
+voices/

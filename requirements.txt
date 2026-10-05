@@ -4,3 +4,5 @@ websockets>=17
 pydantic>=2.13
 pytest>=9
 httpx>=0.28
+faster-whisper>=1.2
+piper-tts>=1.3

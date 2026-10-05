@@ -26,6 +26,25 @@ class Cancel(BaseModel):
     type: Literal["cancel"] = "cancel"
 
 
+class Hello(BaseModel):
+    """Первое сообщение клиента: что он умеет. speech=True — присылать озвучку ответов.
+
+    Без hello звук не шлём: терминальный клиент не умеет двоичные кадры.
+    """
+    type: Literal["hello"] = "hello"
+    speech: bool = False
+
+
+class AudioStart(BaseModel):
+    """Начало голосовой задачи. Дальше идут двоичные кадры: PCM 16 бит, 16 кГц, моно."""
+    type: Literal["audio_start"] = "audio_start"
+
+
+class AudioEnd(BaseModel):
+    """Кнопку отпустили: звук закончился, можно распознавать."""
+    type: Literal["audio_end"] = "audio_end"
+
+
 # ---- сервер -> клиент ----
 
 class Status(BaseModel):
@@ -53,5 +72,23 @@ class Error(BaseModel):
     text: str
 
 
-ClientMessage = Annotated[Union[Task, Decision, Cancel], Field(discriminator="type")]
+class Transcript(BaseModel):
+    """Что сервер услышал. Показываем пользователю до ответа модели."""
+    type: Literal["transcript"] = "transcript"
+    text: str
+
+
+class SpeechStart(BaseModel):
+    """Дальше идут двоичные кадры с озвучкой ответа: PCM 16 бит, моно, sample_rate Гц."""
+    type: Literal["speech_start"] = "speech_start"
+    sample_rate: int
+
+
+class SpeechEnd(BaseModel):
+    type: Literal["speech_end"] = "speech_end"
+
+
+ClientMessage = Annotated[
+    Union[Task, Decision, Cancel, Hello, AudioStart, AudioEnd], Field(discriminator="type")
+]
 client_adapter = TypeAdapter(ClientMessage)
