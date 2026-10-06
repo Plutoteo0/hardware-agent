@@ -57,6 +57,13 @@ class ProjectDelete(BaseModel):
     name: str
 
 
+class ProjectClear(BaseModel):
+    """Очистить историю проекта (файл уходит в _trash). Файлы и заметки остаются.
+    Нужно для «общего»: его нельзя удалить, но историю можно начать заново. Ответ — Projects."""
+    type: Literal["project_clear"] = "project_clear"
+    name: str
+
+
 class HistoryList(BaseModel):
     """Попросить последние вопросы-ответы текущего проекта. Ответ — History."""
     type: Literal["history_list"] = "history_list"
@@ -147,7 +154,7 @@ class SpeechEnd(BaseModel):
 
 ClientMessage = Annotated[
     Union[Task, Decision, Cancel, Hello, AudioStart, AudioEnd, ProjectList, ProjectSwitch, ProjectNew,
-          ProjectDelete, HistoryList],
+          ProjectDelete, ProjectClear, HistoryList],
     Field(discriminator="type"),
 ]
 client_adapter = TypeAdapter(ClientMessage)

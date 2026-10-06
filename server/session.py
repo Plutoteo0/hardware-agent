@@ -131,6 +131,22 @@ class Session:
             self._use(self.projects.current())
         self.on_project_list()
 
+    def on_project_clear(self, name: str) -> None:
+        if not self.projects or self._busy():
+            return
+        project = self.projects.get(name)
+        if project is None:
+            asyncio.create_task(self.send(Error(text=f"no such project: {name}")))
+            return
+        try:
+            self.projects.clear_history(project)
+        except OSError as e:
+            asyncio.create_task(self.send(Error(text=f"cannot clear: {e}")))
+            return
+        if self.project.name == project.name:
+            asyncio.create_task(self.send(self._project_info()))   # плате: ходов теперь 0
+        self.on_project_list()
+
     def on_history_list(self) -> None:
         if not self.project:
             return

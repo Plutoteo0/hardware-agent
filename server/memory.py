@@ -207,6 +207,14 @@ class ProjectStore:
         if self.current().name == project.name:
             self.set_current(self.get(DEFAULT_PROJECT) or Project(self.root / DEFAULT_PROJECT))
 
+    def clear_history(self, project: Project) -> None:
+        """История — в _trash (как удалённые проекты), файлы и заметки остаются."""
+        if not project.history_path.is_file():
+            return
+        trash = self.root / "_trash"
+        trash.mkdir(exist_ok=True)
+        project.history_path.rename(trash / f"{project.name}-history-{datetime.now():%Y%m%d-%H%M%S}.jsonl")
+
     @staticmethod
     def is_auto_named(project: Project) -> bool:
         return bool(AUTO_NAME.match(project.name))

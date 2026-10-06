@@ -7,7 +7,7 @@ from fastapi.testclient import TestClient
 
 import main
 from memory import OFFLOAD_PREVIEW, MemoryError_, Project, ProjectStore, slugify
-from protocol import Result
+from protocol import ConfirmRequest, Result
 from session import Session
 from tools import ToolError, run_tool
 
@@ -147,25 +147,45 @@ def test_second_question_sees_first(tmp_path):
     assert store.current().turns()[-1]["q"] == "как меня зовут?"
 
 
-def test_remember_tool_and_tools_log(tmp_path):
-    store = ProjectStore(tmp_path)
+def remember_with_decision(store, approve):
+    """remember просит подтверждения (RISK = ask): отвечаем на карточку как плата."""
     model = ScriptModel([
         {"tool": "remember", "args": {"fact": "любит чай"}},
-        {"final": "запомнил"},
+        {"final": "готово"},
     ])
 
     async def go():
         sent = []
-        s = make_session(store, model, sent)
+
+        async def send(m):
+            sent.append(m)
+            if isinstance(m, ConfirmRequest):
+                s.on_decision(m.id, approve)
+
+        s = Session(model, send, projects=store, confirm_timeout=2)
         s.start_task("запомни, что я люблю чай")
         await s.task
         return sent
 
-    sent = run(go())
+    return run(go()), model
+
+
+def test_remember_tool_and_tools_log(tmp_path):
+    store = ProjectStore(tmp_path)
+    sent, _ = remember_with_decision(store, approve=True)
     p = store.current()
     assert "любит чай" in p.notes_path.read_text(encoding="utf-8")
     assert p.turns()[-1]["tools"] == [{"tool": "remember", "args": {"fact": "любит чай"}, "ok": True}]
+    assert any(isinstance(m, ConfirmRequest) and m.tool == "remember" for m in sent)
     assert any(isinstance(m, Result) for m in sent)
+
+
+def test_remember_denied_writes_nothing(tmp_path):
+    store = ProjectStore(tmp_path)
+    _, model = remember_with_decision(store, approve=False)
+    p = store.current()
+    assert not p.notes_path.exists() or "любит чай" not in p.notes_path.read_text(encoding="utf-8")
+    assert model.seen[-1][-1] == {"role": "tool", "content": "DENIED: user rejected the call"}
 
 
 def test_switching_project_switches_memory(tmp_path):
@@ -294,6 +314,29 @@ def test_deleting_current_switches_to_default(tmp_path):
     s, sent = run(go())
     assert s.project.name == "общее" and store.current().name == "общее"
     assert sent[-1].type == "projects" and "временный" not in [i.name for i in sent[-1].items]
+
+
+def test_clear_default_history_keeps_files_and_notes(tmp_path):
+    store = ProjectStore(tmp_path)
+    p = store.current()
+    p.append_turn("старый вопрос", "ответ", [])
+    p.remember("любит чай")
+    (p.files / "список.txt").write_text("хлеб", encoding="utf-8")
+
+    async def go():
+        sent = []
+        s = make_session(store, ScriptModel([]), sent)
+        s.on_project_clear("общее")
+        await asyncio.sleep(0)
+        return sent
+
+    sent = run(go())
+    assert p.turns() == []
+    assert (p.files / "список.txt").is_file() and "любит чай" in p.notes_path.read_text(encoding="utf-8")
+    trashed = list((tmp_path / "_trash").iterdir())
+    assert len(trashed) == 1 and "старый вопрос" in trashed[0].read_text(encoding="utf-8")   # можно вернуть
+    assert any(m.type == "project" and m.turns == 0 for m in sent)
+    assert sent[-1].type == "projects"
 
 
 def test_delete_by_name_cannot_escape_store(tmp_path):

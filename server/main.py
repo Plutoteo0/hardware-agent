@@ -14,8 +14,8 @@ from pydantic import BaseModel, ValidationError
 
 from models import MockModel, Model, OllamaModel
 from memory import ProjectStore
-from protocol import (AudioEnd, AudioStart, Cancel, Decision, Error, Hello, HistoryList, ProjectDelete,
-                      ProjectList, ProjectNew, ProjectSwitch, Task, client_adapter)
+from protocol import (AudioEnd, AudioStart, Cancel, Decision, Error, Hello, HistoryList, ProjectClear,
+                      ProjectDelete, ProjectList, ProjectNew, ProjectSwitch, Task, client_adapter)
 from session import Session
 from stt import WhisperTranscriber
 from tools import SANDBOX
@@ -141,6 +141,8 @@ async def ws_endpoint(ws: WebSocket):
                 session.on_project_new(msg.name)
             elif isinstance(msg, ProjectDelete):
                 session.on_project_delete(msg.name)
+            elif isinstance(msg, ProjectClear):
+                session.on_project_clear(msg.name)
             elif isinstance(msg, HistoryList):
                 session.on_history_list()
             elif isinstance(msg, AudioStart):

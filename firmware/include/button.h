@@ -43,6 +43,9 @@ public:
         return ButtonEvent::None;
     }
 
+    // Сколько держат прямо сейчас (0 — отпущена). Для отсчёта «держи ещё N с»
+    uint32_t heldMs() const { return pressed_ ? millis() - pressedAt_ : 0; }
+
 private:
     uint8_t pin_;
     bool lastRaw_ = false, pressed_ = false, holding_ = false;
